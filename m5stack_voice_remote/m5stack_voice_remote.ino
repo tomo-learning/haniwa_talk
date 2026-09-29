@@ -1,0 +1,871 @@
+#include <M5Unified.h>
+#include <NimBLEDevice.h>
+
+
+// ==================================================
+// Bluetooth (BLE)
+// ==================================================
+
+// M5StickC側のスケッチと同じ値にする
+const char* SERVICE_UUID      = "3d436b81-f335-4abf-9169-7b95a4d4df16";
+const char* COMMAND_CHAR_UUID = "07abb273-12ef-45ba-879c-2011ecf81e38";
+const char* NOTIFY_CHAR_UUID  = "da3650aa-5da4-4cac-8ed5-fcdb0b15eb66";
+
+// 接続の状態
+enum LinkState {
+  LINK_SCANNING,
+  LINK_CONNECTING,
+  LINK_CONNECTED
+};
+
+LinkState linkState = LINK_SCANNING;
+
+// スキャンで見つけたM5StickCのアドレス（NimBLEのタスクで書き込む）
+// スキャン結果そのものは次のスキャンで消えるので、アドレスだけを複製して持つ
+NimBLEAddress foundAddress;
+volatile bool deviceFound = false;
+
+// 1回のスキャンの長さ
+// 止まっていたら loop で始め直す（NimBLEの内部のリセットでも止まるため）
+const uint32_t SCAN_TIME_MS = 10000;
+
+unsigned long lastScanStart = 0;
+
+// 切断の知らせ（NimBLEのタスクで書き込む）
+volatile bool disconnected = false;
+
+NimBLEClient* client = nullptr;
+NimBLERemoteCharacteristic* commandCharacteristic = nullptr;
+
+// 通知（NimBLEのタスク）からloopへ文字列を渡すキュー
+const int NOTIFY_MAX_LENGTH = 128;
+const int NOTIFY_QUEUE_SIZE = 40;
+
+QueueHandle_t notifyQueue;
+
+
+// ==================================================
+// M5StickCの状態（通知で更新する）
+// ==================================================
+
+bool stateKnown = false;
+bool stickEnabled = false;
+int playingVoice = -1;
+
+// M5StickCの音量（%）。-1 はまだ受け取っていない
+int stickVolume = -1;
+
+const int VOLUME_MAX = 100;
+const int VOLUME_STEP = 10;
+
+// A の長押しで開く音量画面
+bool volumeScreen = false;
+
+// A をこの時間押し続けると音量画面を開く
+const uint32_t VOLUME_HOLD_MS = 800;
+
+const int MAX_VOICES = 32;
+
+String voiceNames[MAX_VOICES];
+int voiceCount = 0;
+
+// Bで選んでいる音声の番号
+int selectedVoice = 0;
+
+// 状態・一覧を最後に要求した時刻（取りこぼしたときの再要求に使う）
+unsigned long lastStatusRequest = 0;
+unsigned long lastListRequest = 0;
+
+
+// ==================================================
+// 画面
+// ==================================================
+
+const int HEADER_Y = 0;
+const int HEADER_H = 24;
+
+const int STATE_Y = 26;
+const int STATE_H = 40;
+
+const int LIST_Y = 70;
+const int LINE_H = 20;
+const int LIST_LINES = 7;
+
+const int LABEL_Y = 218;
+const int LABEL_H = 22;
+
+// 再生中の表示を置く位置（名前はこの左で切る）
+const int PLAYING_MARK_X = 250;
+
+bool headerDirty = true;
+bool stateDirty = true;
+bool listDirty = true;
+bool labelsDirty = true;
+
+
+void drawHeader() {
+
+  M5.Display.fillRect(0, HEADER_Y, 320, HEADER_H, TFT_BLACK);
+
+  M5.Display.setFont(&fonts::lgfxJapanGothicP_16);
+  M5.Display.setTextDatum(textdatum_t::middle_left);
+
+
+  if (linkState == LINK_CONNECTED) {
+
+    M5.Display.setTextColor(TFT_GREEN, TFT_BLACK);
+    M5.Display.drawString("M5StickC に接続済み", 8, HEADER_Y + HEADER_H / 2);
+
+    // 音量画面の開き方
+    if (!volumeScreen) {
+      M5.Display.setTextDatum(textdatum_t::middle_right);
+      M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+      M5.Display.drawString("A長押し: 音量", 312, HEADER_Y + HEADER_H / 2);
+    }
+
+  } else if (linkState == LINK_CONNECTING) {
+
+    M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
+    M5.Display.drawString("M5StickC への接続を試みています", 8, HEADER_Y + HEADER_H / 2);
+
+  } else {
+
+    M5.Display.setTextColor(TFT_YELLOW, TFT_BLACK);
+    M5.Display.drawString("M5StickC を探しています", 8, HEADER_Y + HEADER_H / 2);
+
+  }
+}
+
+
+void drawState() {
+
+  M5.Display.fillRect(0, STATE_Y, 320, STATE_H, TFT_BLACK);
+
+  M5.Display.setFont(&fonts::FreeSansBold18pt7b);
+  M5.Display.setTextDatum(textdatum_t::middle_center);
+
+
+  bool connected = (linkState == LINK_CONNECTED);
+
+  if (!connected || !stateKnown) {
+
+    M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    M5.Display.drawString("--", 110, STATE_Y + STATE_H / 2);
+
+  } else if (stickEnabled) {
+
+    M5.Display.setTextColor(TFT_GREEN, TFT_BLACK);
+    M5.Display.drawString("ON", 110, STATE_Y + STATE_H / 2);
+
+  } else {
+
+    M5.Display.setTextColor(TFT_RED, TFT_BLACK);
+    M5.Display.drawString("OFF", 110, STATE_Y + STATE_H / 2);
+
+  }
+
+
+  // 音量
+  M5.Display.setFont(&fonts::lgfxJapanGothicP_16);
+  M5.Display.setTextDatum(textdatum_t::middle_right);
+  M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+
+  String volumeText =
+      (connected && stickVolume >= 0) ? String(stickVolume) + "%" : String("--");
+
+  M5.Display.drawString("音量 " + volumeText, 312, STATE_Y + STATE_H / 2);
+}
+
+
+// 音量画面（一覧の場所に表示する）
+void drawVolume() {
+
+  M5.Display.fillRect(0, LIST_Y, 320, LINE_H * LIST_LINES, TFT_BLACK);
+
+
+  M5.Display.setFont(&fonts::lgfxJapanGothicP_16);
+  M5.Display.setTextDatum(textdatum_t::middle_left);
+  M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+  M5.Display.drawString("音量", 20, LIST_Y + 12);
+
+
+  M5.Display.setFont(&fonts::FreeSansBold18pt7b);
+  M5.Display.setTextDatum(textdatum_t::middle_center);
+  M5.Display.drawString(stickVolume < 0 ? String("--") : String(stickVolume) + "%", 160, LIST_Y + 50);
+
+
+  // 0〜100 % の棒
+  const int barX = 20;
+  const int barY = LIST_Y + 84;
+  const int barW = 280;
+  const int barH = 24;
+
+  M5.Display.drawRect(barX, barY, barW, barH, TFT_WHITE);
+
+  if (stickVolume > 0) {
+    M5.Display.fillRect(barX + 2, barY + 2, (barW - 4) * stickVolume / VOLUME_MAX, barH - 4, TFT_GREEN);
+  }
+}
+
+
+void drawList() {
+
+  M5.Display.fillRect(0, LIST_Y, 320, LINE_H * LIST_LINES, TFT_BLACK);
+
+  M5.Display.setFont(&fonts::lgfxJapanGothicP_16);
+
+
+  if (voiceCount == 0) {
+
+    if (linkState == LINK_CONNECTED) {
+
+      M5.Display.setTextDatum(textdatum_t::middle_left);
+      M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+      M5.Display.drawString("音声の一覧を受信しています", 8, LIST_Y + LINE_H / 2);
+
+    }
+
+    return;
+  }
+
+
+  // 選んでいる音声が見える位置から表示する
+  int top = selectedVoice - LIST_LINES / 2;
+
+  if (top > voiceCount - LIST_LINES) {
+    top = voiceCount - LIST_LINES;
+  }
+
+  if (top < 0) {
+    top = 0;
+  }
+
+
+  for (int row = 0; row < LIST_LINES; row++) {
+
+    int index = top + row;
+
+    if (index >= voiceCount) {
+      break;
+    }
+
+
+    int y = LIST_Y + row * LINE_H;
+
+    bool selected = (index == selectedVoice);
+
+    uint16_t background = selected ? TFT_WHITE : TFT_BLACK;
+    uint16_t foreground = selected ? TFT_BLACK : TFT_WHITE;
+
+    M5.Display.fillRect(0, y, 320, LINE_H, background);
+
+
+    // 番号と名前
+    M5.Display.setClipRect(0, y, PLAYING_MARK_X - 4, LINE_H);
+
+    M5.Display.setTextDatum(textdatum_t::middle_left);
+    M5.Display.setTextColor(foreground, background);
+    M5.Display.drawString(String(index) + "  " + voiceNames[index], 8, y + LINE_H / 2);
+
+    M5.Display.clearClipRect();
+
+
+    // 再生中の表示
+    if (index == playingVoice) {
+
+      M5.Display.setTextDatum(textdatum_t::middle_right);
+      M5.Display.setTextColor(selected ? TFT_RED : TFT_GREEN, background);
+      M5.Display.drawString("再生中", 312, y + LINE_H / 2);
+
+    }
+  }
+}
+
+
+void drawLabels() {
+
+  M5.Display.fillRect(0, LABEL_Y, 320, LABEL_H, TFT_BLACK);
+
+  M5.Display.setFont(&fonts::lgfxJapanGothicP_16);
+  M5.Display.setTextDatum(textdatum_t::middle_center);
+  M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
+
+  // ボタンA・B・Cの真上に置く
+  if (volumeScreen) {
+
+    M5.Display.drawString("戻る", 68, LABEL_Y + LABEL_H / 2);
+    M5.Display.drawString("下げる", 160, LABEL_Y + LABEL_H / 2);
+    M5.Display.drawString("上げる", 252, LABEL_Y + LABEL_H / 2);
+
+  } else {
+
+    M5.Display.drawString("ON/OFF", 68, LABEL_Y + LABEL_H / 2);
+    M5.Display.drawString("次へ", 160, LABEL_Y + LABEL_H / 2);
+    M5.Display.drawString("再生", 252, LABEL_Y + LABEL_H / 2);
+
+  }
+}
+
+
+void redrawIfNeeded() {
+
+  if (headerDirty) {
+    headerDirty = false;
+    drawHeader();
+  }
+
+  if (stateDirty) {
+    stateDirty = false;
+    drawState();
+  }
+
+  if (listDirty) {
+    listDirty = false;
+
+    if (volumeScreen) {
+      drawVolume();
+    } else {
+      drawList();
+    }
+  }
+
+  if (labelsDirty) {
+    labelsDirty = false;
+    drawLabels();
+  }
+}
+
+
+// ==================================================
+// BLE受信
+// ==================================================
+
+class ScanCallbacks : public NimBLEScanCallbacks {
+
+  void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
+
+    if (!deviceFound && advertisedDevice->isAdvertisingService(NimBLEUUID(SERVICE_UUID))) {
+
+      // アドレスを複製してから知らせる
+      foundAddress = advertisedDevice->getAddress();
+      deviceFound = true;
+
+      // 接続の前にスキャンを止める
+      NimBLEDevice::getScan()->stop();
+
+    }
+  }
+};
+
+
+class ClientCallbacks : public NimBLEClientCallbacks {
+
+  void onDisconnect(NimBLEClient* pClient, int reason) override {
+
+    Serial.printf("Disconnected: %d\n", reason);
+
+    // 探し直しはloopで行う
+    disconnected = true;
+  }
+};
+
+
+// 末尾で途中まで切れた UTF-8 の文字を除いた長さを返す
+// （MTU や NOTIFY_MAX_LENGTH で通知が切れた場合に、文字化けした文字を描かないため）
+size_t completeUtf8Length(const char* text, size_t length) {
+
+  // 最後の文字の先頭バイトを探す
+  size_t start = length;
+
+  while (start > 0 && (text[start - 1] & 0xC0) == 0x80) {
+    start--;
+  }
+
+  if (start == 0) {
+    return 0;
+  }
+
+
+  uint8_t lead = text[start - 1];
+
+  size_t need =
+      (lead & 0x80) == 0x00 ? 1 :
+      (lead & 0xE0) == 0xC0 ? 2 :
+      (lead & 0xF0) == 0xE0 ? 3 :
+      (lead & 0xF8) == 0xF0 ? 4 : 1;
+
+  return (length - (start - 1) < need) ? start - 1 : length;
+}
+
+
+// 通知の文字列をキューに入れるだけにする
+// （中身の処理はloop側で行う）
+void onNotify(
+  NimBLERemoteCharacteristic* characteristic,
+  uint8_t* data,
+  size_t length,
+  bool isNotify
+) {
+
+  char text[NOTIFY_MAX_LENGTH + 1];
+
+  size_t n = std::min(length, (size_t)NOTIFY_MAX_LENGTH);
+
+  memcpy(text, data, n);
+
+  n = completeUtf8Length(text, n);
+
+  text[n] = '\0';
+
+
+  // キューが一杯なら捨てる
+  xQueueSend(notifyQueue, text, 0);
+}
+
+
+// "STATE ON -1"  "VOL 80"  "COUNT k"  "NAME i 名前"  "ERR 内容"
+void handleNotify(const String& text) {
+
+  Serial.print("Notify: ");
+  Serial.println(text);
+
+
+  if (text.startsWith("STATE ")) {
+
+    int space = text.indexOf(' ', 6);
+
+    if (space < 0) {
+      return;
+    }
+
+    stickEnabled = (text.substring(6, space) == "ON");
+    playingVoice = text.substring(space + 1).toInt();
+    stateKnown = true;
+
+    stateDirty = true;
+    listDirty = true;
+
+  } else if (text.startsWith("VOL ")) {
+
+    stickVolume = text.substring(4).toInt();
+
+    stateDirty = true;
+
+    if (volumeScreen) {
+      listDirty = true;
+    }
+
+  } else if (text.startsWith("COUNT ")) {
+
+    voiceCount = text.substring(6).toInt();
+
+    if (voiceCount > MAX_VOICES) {
+      voiceCount = MAX_VOICES;
+    }
+
+    for (int i = 0; i < MAX_VOICES; i++) {
+      voiceNames[i] = "";
+    }
+
+    if (selectedVoice >= voiceCount) {
+      selectedVoice = 0;
+    }
+
+    listDirty = true;
+
+  } else if (text.startsWith("NAME ")) {
+
+    int space = text.indexOf(' ', 5);
+
+    if (space < 0) {
+      return;
+    }
+
+    int index = text.substring(5, space).toInt();
+
+    if (index >= 0 && index < voiceCount) {
+      voiceNames[index] = text.substring(space + 1);
+      listDirty = true;
+    }
+
+  }
+}
+
+
+// ==================================================
+// BLE送信
+// ==================================================
+
+void sendCommand(const String& command) {
+
+  if (linkState != LINK_CONNECTED || commandCharacteristic == nullptr) {
+    return;
+  }
+
+
+  Serial.print("Send: ");
+  Serial.println(command);
+
+  commandCharacteristic->writeValue(command.c_str(), command.length(), true);
+}
+
+
+void requestStatus() {
+
+  lastStatusRequest = millis();
+
+  sendCommand("STATUS");
+}
+
+
+void requestList() {
+
+  lastListRequest = millis();
+
+  sendCommand("LIST");
+}
+
+
+// 音量を VOLUME_STEP ずつ変える
+// 画面はすぐに書き換え、M5StickCからの VOL の通知で確定する
+void changeVolume(int delta) {
+
+  if (stickVolume < 0) {
+    requestStatus();
+    return;
+  }
+
+
+  int volume = constrain(stickVolume + delta, 0, VOLUME_MAX);
+
+  if (volume == stickVolume) {
+    return;
+  }
+
+
+  stickVolume = volume;
+
+  stateDirty = true;
+  listDirty = true;
+
+  sendCommand("VOL " + String(volume));
+}
+
+
+// 一覧の名前がすべてそろっているか
+bool listComplete() {
+
+  if (voiceCount == 0) {
+    return false;
+  }
+
+  for (int i = 0; i < voiceCount; i++) {
+    if (voiceNames[i].length() == 0) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+
+// ==================================================
+// 接続
+// ==================================================
+
+// isContinue = false で前回のスキャン結果を消してから始める
+void startScan() {
+
+  lastScanStart = millis();
+
+  NimBLEDevice::getScan()->start(SCAN_TIME_MS, false, true);
+}
+
+
+bool connectToStick() {
+
+  if (client == nullptr) {
+
+    client = NimBLEDevice::createClient();
+
+    client->setClientCallbacks(new ClientCallbacks(), true);
+
+    client->setConnectTimeout(5000);
+
+  }
+
+
+  if (!client->connect(foundAddress)) {
+    Serial.println("Connect failed");
+    return false;
+  }
+
+
+  NimBLERemoteService* service = client->getService(SERVICE_UUID);
+
+  if (service == nullptr) {
+    Serial.println("Service not found");
+    client->disconnect();
+    return false;
+  }
+
+
+  commandCharacteristic = service->getCharacteristic(COMMAND_CHAR_UUID);
+
+  NimBLERemoteCharacteristic* notifyCharacteristic =
+      service->getCharacteristic(NOTIFY_CHAR_UUID);
+
+  if (commandCharacteristic == nullptr || notifyCharacteristic == nullptr) {
+    Serial.println("Characteristic not found");
+    client->disconnect();
+    return false;
+  }
+
+
+  if (!notifyCharacteristic->subscribe(true, onNotify)) {
+    Serial.println("Subscribe failed");
+    client->disconnect();
+    return false;
+  }
+
+
+  Serial.println("Connected");
+
+  return true;
+}
+
+
+// ==================================================
+// setup
+// ==================================================
+
+void setup() {
+
+  auto cfg = M5.config();
+
+  M5.begin(cfg);
+
+
+  notifyQueue = xQueueCreate(NOTIFY_QUEUE_SIZE, NOTIFY_MAX_LENGTH + 1);
+
+
+  // A の短押し（ON/OFF）と長押し（音量画面）を分ける時間
+  M5.BtnA.setHoldThresh(VOLUME_HOLD_MS);
+
+
+  M5.Display.fillScreen(TFT_BLACK);
+
+  redrawIfNeeded();
+
+
+  NimBLEDevice::init("M5Stack");
+
+  NimBLEScan* scan = NimBLEDevice::getScan();
+
+  scan->setScanCallbacks(new ScanCallbacks(), false);
+
+  scan->setActiveScan(true);
+
+  startScan();
+
+
+  Serial.println("M5Stack remote started");
+}
+
+
+// ==================================================
+// loop
+// ==================================================
+
+void loop() {
+
+  M5.update();
+
+
+  // ==================================================
+  // 通知の処理
+  // ==================================================
+
+  char text[NOTIFY_MAX_LENGTH + 1];
+
+  while (xQueueReceive(notifyQueue, text, 0) == pdTRUE) {
+    handleNotify(String(text));
+  }
+
+
+  // ==================================================
+  // 切断されたら探し直す
+  // ==================================================
+
+  // 接続に失敗したときの切断の知らせが後から届くことがあるので
+  // 実際に切れているかを確かめる
+  if (disconnected && (client == nullptr || !client->isConnected())) {
+
+    disconnected = false;
+
+    linkState = LINK_SCANNING;
+    commandCharacteristic = nullptr;
+    stateKnown = false;
+    playingVoice = -1;
+    stickVolume = -1;
+
+    // 音量画面は接続中だけ使う
+    volumeScreen = false;
+
+    // スキャンは下の判定で始め直す
+    deviceFound = false;
+
+    headerDirty = true;
+    stateDirty = true;
+    listDirty = true;
+    labelsDirty = true;
+  }
+
+
+  // ==================================================
+  // スキャンが止まっていたら始め直す
+  // ==================================================
+
+  if (
+    linkState == LINK_SCANNING &&
+    !deviceFound &&
+    !NimBLEDevice::getScan()->isScanning() &&
+    millis() - lastScanStart > 1000
+  ) {
+    startScan();
+  }
+
+
+  // ==================================================
+  // 見つけたら接続する
+  // ==================================================
+
+  if (linkState == LINK_SCANNING && deviceFound) {
+
+    linkState = LINK_CONNECTING;
+
+    headerDirty = true;
+    redrawIfNeeded();
+
+
+    if (connectToStick()) {
+
+      linkState = LINK_CONNECTED;
+
+      // 音声一覧と状態を受け取る
+      requestList();
+      requestStatus();
+
+    } else {
+
+      linkState = LINK_SCANNING;
+
+      // スキャンは上の判定で始め直す
+      deviceFound = false;
+
+    }
+
+    headerDirty = true;
+    stateDirty = true;
+    listDirty = true;
+  }
+
+
+  // ==================================================
+  // 最初の通知を取りこぼしたときは要求し直す
+  // ==================================================
+
+  if (linkState == LINK_CONNECTED) {
+
+    // STATUS には状態と音量の両方が返る
+    if ((!stateKnown || stickVolume < 0) && millis() - lastStatusRequest > 1000) {
+      requestStatus();
+    }
+
+    // 一覧の送信は再生が終わるまで待たされるので、間隔を長めにとる
+    if (!listComplete() && millis() - lastListRequest > 3000) {
+      requestList();
+    }
+  }
+
+
+  // ==================================================
+  // ボタン
+  // ==================================================
+
+  if (volumeScreen) {
+
+    // ------------------------------
+    // 音量画面
+    // ------------------------------
+
+    // A: 元の画面に戻る
+    // （長押しで開いたときの指の離しは wasClicked にならない）
+    if (M5.BtnA.wasClicked()) {
+
+      volumeScreen = false;
+
+      headerDirty = true;
+      listDirty = true;
+      labelsDirty = true;
+
+    }
+
+    // B: 下げる
+    if (M5.BtnB.wasPressed()) {
+      changeVolume(-VOLUME_STEP);
+    }
+
+    // C: 上げる
+    if (M5.BtnC.wasPressed()) {
+      changeVolume(VOLUME_STEP);
+    }
+
+  } else {
+
+    // ------------------------------
+    // 通常の画面
+    // ------------------------------
+
+    // A 短押し: ON/OFF の切り替え
+    // 長押しと区別するため、離したときに切り替える
+    // 状態が分からないときは、切り替えずに状態を要求する
+    if (M5.BtnA.wasClicked()) {
+
+      if (stateKnown) {
+        sendCommand(stickEnabled ? "OFF" : "ON");
+      } else {
+        requestStatus();
+      }
+
+    }
+
+    // A 長押し: 音量画面を開く
+    if (M5.BtnA.wasHold() && linkState == LINK_CONNECTED) {
+
+      volumeScreen = true;
+
+      headerDirty = true;
+      listDirty = true;
+      labelsDirty = true;
+
+    }
+
+    // B: 次の音声を選ぶ
+    if (M5.BtnB.wasPressed() && voiceCount > 0) {
+      selectedVoice = (selectedVoice + 1) % voiceCount;
+      listDirty = true;
+    }
+
+    // C: 選んでいる音声を再生する（ポン出し）
+    if (M5.BtnC.wasPressed() && voiceCount > 0) {
+      sendCommand("PLAY " + String(selectedVoice));
+    }
+
+  }
+
+
+  redrawIfNeeded();
+
+  delay(10);
+}
