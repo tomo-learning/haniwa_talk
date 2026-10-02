@@ -1,5 +1,6 @@
 #include <M5Unified.h>
 #include <NimBLEDevice.h>
+#include <Wire.h>
 
 
 // ==================================================
@@ -45,6 +46,39 @@ QueueHandle_t notifyQueue;
 
 
 // ==================================================
+// Joystick Unit U024 (I2C)
+// ==================================================
+
+// M5Stack Port A: SDA=GPIO21, SCL=GPIO22
+const uint8_t JOYSTICK_ADDR = 0x52;
+const int JOYSTICK_CENTER = 128;
+const int JOYSTICK_DEAD_ZONE = 35;
+
+// ユニットの取り付け向きが違う場合は，ここで軸を合わせる
+// 90度回転なら SWAP_XY と必要な INVERT を組み合わせる
+const bool JOYSTICK_SWAP_XY = false;
+const bool JOYSTICK_INVERT_X = false;
+const bool JOYSTICK_INVERT_Y = false;
+
+const uint32_t JOYSTICK_POLL_MS = 20;
+const uint32_t DRIVE_HEARTBEAT_MS = 150;
+const uint32_t JOYSTICK_LOST_STOP_MS = 300;
+
+unsigned long lastJoystickPoll = 0;
+unsigned long lastJoystickGood = 0;
+unsigned long lastDriveSend = 0;
+
+// F:前進, B:後退, L:左旋回, R:右旋回, S:停止
+char currentDriveCommand = 'S';
+
+// ジョイスティック押し込み（Z軸ボタン）でZumo走行ON/OFFを切り替える
+// U024は押下時1，非押下時0。チャタリング対策として安定後に1回だけ反応する。
+const uint32_t JOYSTICK_BUTTON_DEBOUNCE_MS = 40;
+bool joystickButtonRaw = false;
+bool joystickButtonStable = false;
+unsigned long joystickButtonChangedAt = 0;
+
+// ==================================================
 // M5StickCの状態（通知で更新する）
 // ==================================================
 
@@ -58,10 +92,18 @@ int stickVolume = -1;
 const int VOLUME_MAX = 100;
 const int VOLUME_STEP = 10;
 
-// A の長押しで開く音量画面
-bool volumeScreen = false;
+// 画面モード
+enum UiScreen {
+  SCREEN_MAIN,
+  SCREEN_VOLUME
+};
 
-// A をこの時間押し続けると音量画面を開く
+UiScreen uiScreen = SCREEN_MAIN;
+
+// Zumo走行の有効/無効。従来挙動を維持するため初期値はON。
+bool zumoDriveEnabled = true;
+
+// A をこの時間押し続けると音量画面へ移る
 const uint32_t VOLUME_HOLD_MS = 800;
 
 const int MAX_VOICES = 32;
@@ -116,11 +158,13 @@ void drawHeader() {
     M5.Display.setTextColor(TFT_GREEN, TFT_BLACK);
     M5.Display.drawString("M5StickC に接続済み", 8, HEADER_Y + HEADER_H / 2);
 
-    // 音量画面の開き方
-    if (!volumeScreen) {
-      M5.Display.setTextDatum(textdatum_t::middle_right);
-      M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    M5.Display.setTextDatum(textdatum_t::middle_right);
+    M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+
+    if (uiScreen == SCREEN_MAIN) {
       M5.Display.drawString("A長押し: 音量", 312, HEADER_Y + HEADER_H / 2);
+    } else {
+      M5.Display.drawString("A: 戻る", 312, HEADER_Y + HEADER_H / 2);
     }
 
   } else if (linkState == LINK_CONNECTING) {
@@ -141,32 +185,32 @@ void drawState() {
 
   M5.Display.fillRect(0, STATE_Y, 320, STATE_H, TFT_BLACK);
 
-  M5.Display.setFont(&fonts::FreeSansBold18pt7b);
-  M5.Display.setTextDatum(textdatum_t::middle_center);
-
-
   bool connected = (linkState == LINK_CONNECTED);
 
-  if (!connected || !stateKnown) {
+  // 音声機能の状態
+  M5.Display.setFont(&fonts::lgfxJapanGothicP_16);
+  M5.Display.setTextDatum(textdatum_t::middle_left);
+  M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+  M5.Display.drawString("音声", 8, STATE_Y + STATE_H / 2);
 
-    M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    M5.Display.drawString("--", 110, STATE_Y + STATE_H / 2);
+  String voiceState = "--";
+  uint16_t voiceColor = TFT_DARKGREY;
 
-  } else if (stickEnabled) {
-
-    M5.Display.setTextColor(TFT_GREEN, TFT_BLACK);
-    M5.Display.drawString("ON", 110, STATE_Y + STATE_H / 2);
-
-  } else {
-
-    M5.Display.setTextColor(TFT_RED, TFT_BLACK);
-    M5.Display.drawString("OFF", 110, STATE_Y + STATE_H / 2);
-
+  if (connected && stateKnown) {
+    voiceState = stickEnabled ? "ON" : "OFF";
+    voiceColor = stickEnabled ? TFT_GREEN : TFT_RED;
   }
 
+  M5.Display.setTextColor(voiceColor, TFT_BLACK);
+  M5.Display.drawString(voiceState, 48, STATE_Y + STATE_H / 2);
+
+  // Zumo走行の状態（ジョイスティック押し込みで切り替え）
+  M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
+  M5.Display.drawString("Zumo", 102, STATE_Y + STATE_H / 2);
+  M5.Display.setTextColor(zumoDriveEnabled ? TFT_GREEN : TFT_RED, TFT_BLACK);
+  M5.Display.drawString(zumoDriveEnabled ? "ON" : "OFF", 150, STATE_Y + STATE_H / 2);
 
   // 音量
-  M5.Display.setFont(&fonts::lgfxJapanGothicP_16);
   M5.Display.setTextDatum(textdatum_t::middle_right);
   M5.Display.setTextColor(TFT_WHITE, TFT_BLACK);
 
@@ -291,7 +335,7 @@ void drawLabels() {
   M5.Display.setTextColor(TFT_CYAN, TFT_BLACK);
 
   // ボタンA・B・Cの真上に置く
-  if (volumeScreen) {
+  if (uiScreen == SCREEN_VOLUME) {
 
     M5.Display.drawString("戻る", 68, LABEL_Y + LABEL_H / 2);
     M5.Display.drawString("下げる", 160, LABEL_Y + LABEL_H / 2);
@@ -322,7 +366,7 @@ void redrawIfNeeded() {
   if (listDirty) {
     listDirty = false;
 
-    if (volumeScreen) {
+    if (uiScreen == SCREEN_VOLUME) {
       drawVolume();
     } else {
       drawList();
@@ -451,7 +495,7 @@ void handleNotify(const String& text) {
 
     stateDirty = true;
 
-    if (volumeScreen) {
+    if (uiScreen == SCREEN_VOLUME) {
       listDirty = true;
     }
 
@@ -507,6 +551,212 @@ void sendCommand(const String& command) {
   Serial.println(command);
 
   commandCharacteristic->writeValue(command.c_str(), command.length(), true);
+}
+
+
+
+// ==================================================
+// ジョイスティック読み取り・走行コマンド送信
+// ==================================================
+
+bool readJoystick(uint8_t& x, uint8_t& y, uint8_t& button) {
+
+  Wire.requestFrom(JOYSTICK_ADDR, (uint8_t)3);
+
+  if (Wire.available() < 3) {
+    return false;
+  }
+
+  x = Wire.read();
+  y = Wire.read();
+  button = Wire.read();
+
+  // 念のため余分なバイトがあれば捨てる
+  while (Wire.available()) {
+    Wire.read();
+  }
+
+  return true;
+}
+
+
+char joystickToDriveCommand(uint8_t x, uint8_t y) {
+
+  int dx = (int)x - JOYSTICK_CENTER;
+
+  // U024を普通の向きに置いた場合，Yが小さい側を「前」にする
+  int dy = JOYSTICK_CENTER - (int)y;
+
+  if (JOYSTICK_SWAP_XY) {
+    int temp = dx;
+    dx = dy;
+    dy = temp;
+  }
+
+  if (JOYSTICK_INVERT_X) {
+    dx = -dx;
+  }
+
+  if (JOYSTICK_INVERT_Y) {
+    dy = -dy;
+  }
+
+  // 中央付近は停止
+  if (
+    abs(dx) < JOYSTICK_DEAD_ZONE &&
+    abs(dy) < JOYSTICK_DEAD_ZONE
+  ) {
+    return 'S';
+  }
+
+  // 大きく倒している軸を優先して4方向に分類
+  if (abs(dy) >= abs(dx)) {
+    return (dy > 0) ? 'F' : 'B';
+  }
+
+  return (dx > 0) ? 'R' : 'L';
+}
+
+
+void sendDriveCommand(char direction) {
+
+  if (
+    linkState != LINK_CONNECTED ||
+    commandCharacteristic == nullptr
+  ) {
+    return;
+  }
+
+  String command = "DRIVE ";
+  command += direction;
+
+  // 走行コマンドは150 msごとに繰り返すので，
+  // WRITE_NR（応答なし）で軽く送る
+  commandCharacteristic->writeValue(
+    command.c_str(),
+    command.length(),
+    false
+  );
+
+  lastDriveSend = millis();
+}
+
+
+void setZumoDriveEnabled(bool enabled) {
+
+  if (zumoDriveEnabled == enabled) {
+    return;
+  }
+
+  zumoDriveEnabled = enabled;
+
+  // OFFにした瞬間に必ず停止させる
+  if (!zumoDriveEnabled) {
+    currentDriveCommand = 'S';
+    sendDriveCommand('S');
+  }
+
+  stateDirty = true;
+
+  Serial.print("Zumo drive: ");
+  Serial.println(zumoDriveEnabled ? "ON" : "OFF");
+}
+
+
+void updateJoystickButton(uint8_t button, unsigned long now) {
+
+  bool pressed = (button != 0);
+
+  // 生の入力が変化した時刻を記録
+  if (pressed != joystickButtonRaw) {
+    joystickButtonRaw = pressed;
+    joystickButtonChangedAt = now;
+  }
+
+  // 一定時間同じ状態が続いたら確定
+  if (
+    now - joystickButtonChangedAt >= JOYSTICK_BUTTON_DEBOUNCE_MS &&
+    joystickButtonStable != joystickButtonRaw
+  ) {
+    joystickButtonStable = joystickButtonRaw;
+
+    // 押した瞬間だけON/OFFを反転する
+    if (joystickButtonStable) {
+      setZumoDriveEnabled(!zumoDriveEnabled);
+    }
+  }
+}
+
+
+void updateJoystick() {
+
+  unsigned long now = millis();
+
+  if (now - lastJoystickPoll < JOYSTICK_POLL_MS) {
+    return;
+  }
+
+  lastJoystickPoll = now;
+
+  uint8_t x = 0;
+  uint8_t y = 0;
+  uint8_t button = 0;
+
+  if (!readJoystick(x, y, button)) {
+
+    // ジョイスティックが抜けた/読めなくなった場合は停止
+    if (
+      now - lastJoystickGood > JOYSTICK_LOST_STOP_MS &&
+      currentDriveCommand != 'S'
+    ) {
+      currentDriveCommand = 'S';
+      sendDriveCommand('S');
+      Serial.println("Joystick lost -> STOP");
+    }
+
+    return;
+  }
+
+  lastJoystickGood = now;
+
+  // ZumoがOFFでも押し込みで再びONにできるよう，
+  // 走行判定より先にボタンを常に処理する。
+  updateJoystickButton(button, now);
+
+  // Zumo走行がOFFの間は必ず停止コマンドだけを送る。
+  if (!zumoDriveEnabled) {
+    bool changed = (currentDriveCommand != 'S');
+    bool heartbeat = (now - lastDriveSend >= DRIVE_HEARTBEAT_MS);
+
+    currentDriveCommand = 'S';
+
+    if (changed || heartbeat) {
+      sendDriveCommand('S');
+    }
+
+    return;
+  }
+
+  char nextCommand = joystickToDriveCommand(x, y);
+
+  bool changed = (nextCommand != currentDriveCommand);
+  bool heartbeat = (now - lastDriveSend >= DRIVE_HEARTBEAT_MS);
+
+  if (changed) {
+    currentDriveCommand = nextCommand;
+
+    Serial.printf(
+      "Joystick x=%u y=%u button=%u -> %c\n",
+      x,
+      y,
+      button,
+      currentDriveCommand
+    );
+  }
+
+  if (changed || heartbeat) {
+    sendDriveCommand(currentDriveCommand);
+  }
 }
 
 
@@ -646,10 +896,15 @@ void setup() {
   M5.begin(cfg);
 
 
+  // Joystick Unit U024 on Port A (I2C)
+  Wire.begin(21, 22, 400000);
+  lastJoystickGood = millis();
+
+
   notifyQueue = xQueueCreate(NOTIFY_QUEUE_SIZE, NOTIFY_MAX_LENGTH + 1);
 
 
-  // A の短押し（ON/OFF）と長押し（音量画面）を分ける時間
+  // A の短押し（音声ON/OFF）と長押し（音量画面）を分ける時間
   M5.BtnA.setHoldThresh(VOLUME_HOLD_MS);
 
 
@@ -682,6 +937,10 @@ void loop() {
   M5.update();
 
 
+  // ジョイスティック入力をBLEでM5StickCへ送る
+  updateJoystick();
+
+
   // ==================================================
   // 通知の処理
   // ==================================================
@@ -709,8 +968,8 @@ void loop() {
     playingVoice = -1;
     stickVolume = -1;
 
-    // 音量画面は接続中だけ使う
-    volumeScreen = false;
+    // 設定画面は接続中だけ使う
+    uiScreen = SCREEN_MAIN;
 
     // スキャンは下の判定で始め直す
     deviceFound = false;
@@ -793,17 +1052,16 @@ void loop() {
   // ボタン
   // ==================================================
 
-  if (volumeScreen) {
+  if (uiScreen == SCREEN_VOLUME) {
 
     // ------------------------------
     // 音量画面
     // ------------------------------
 
-    // A: 元の画面に戻る
-    // （長押しで開いたときの指の離しは wasClicked にならない）
+    // A短押し: 元の画面に戻る
     if (M5.BtnA.wasClicked()) {
 
-      volumeScreen = false;
+      uiScreen = SCREEN_MAIN;
 
       headerDirty = true;
       listDirty = true;
@@ -827,7 +1085,7 @@ void loop() {
     // 通常の画面
     // ------------------------------
 
-    // A 短押し: ON/OFF の切り替え
+    // A 短押し: 音声機能ON/OFF の切り替え
     // 長押しと区別するため、離したときに切り替える
     // 状態が分からないときは、切り替えずに状態を要求する
     if (M5.BtnA.wasClicked()) {
@@ -843,7 +1101,7 @@ void loop() {
     // A 長押し: 音量画面を開く
     if (M5.BtnA.wasHold() && linkState == LINK_CONNECTED) {
 
-      volumeScreen = true;
+      uiScreen = SCREEN_VOLUME;
 
       headerDirty = true;
       listDirty = true;
@@ -863,7 +1121,6 @@ void loop() {
     }
 
   }
-
 
   redrawIfNeeded();
 

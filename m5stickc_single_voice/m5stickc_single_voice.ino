@@ -28,7 +28,7 @@ NimBLECharacteristic* notifyCharacteristic = nullptr;
 
 // BLE受信（NimBLEのタスク）からloopへコマンドを渡すキュー
 const int COMMAND_MAX_LENGTH = 50;
-const int COMMAND_QUEUE_SIZE = 8;
+const int COMMAND_QUEUE_SIZE = 16;
 
 QueueHandle_t commandQueue;
 
@@ -57,6 +57,54 @@ const int SPK_ENABLE_PIN = 0;
 const int SPK_AUDIO_PIN  = 26;
 
 const int SAMPLE_RATE = 16000;
+
+
+// ==================================================
+// Arduino Uno / Zumo へのUART
+// ==================================================
+
+// M5StickCのG32をTXとして使う
+// 配線: M5StickC G32 -> Arduino Uno A1
+//       M5StickC GND -> Arduino/Zumo GND
+const int UNO_UART_RX_PIN = 33;  // 今回は受信に使わない
+const int UNO_UART_TX_PIN = 32;
+const uint32_t UNO_UART_BAUD = 9600;
+
+HardwareSerial UnoSerial(2);
+
+// BLE切断時にloop側でSTOPを送るためのフラグ
+volatile bool driveStopRequested = false;
+
+// デバッグ表示は方向が変わったときだけ行う
+char lastForwardedDriveCommand = 'S';
+
+
+bool isDriveCommand(char command) {
+  return
+    command == 'F' ||
+    command == 'B' ||
+    command == 'L' ||
+    command == 'R' ||
+    command == 'S';
+}
+
+
+void sendDriveToUno(char command) {
+
+  if (!isDriveCommand(command)) {
+    return;
+  }
+
+  UnoSerial.write(command);
+  UnoSerial.write('\n');
+
+  // BLEのハートビートは頻繁に来るので，変化時だけUSB Serialへ表示する
+  if (command != lastForwardedDriveCommand) {
+    Serial.print("UART -> Uno: ");
+    Serial.println(command);
+    lastForwardedDriveCommand = command;
+  }
+}
 
 
 // ==================================================
@@ -372,6 +420,9 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 
     Serial.print("BLE disconnected: ");
     Serial.println(reason);
+
+    // コントローラとのBLEが切れたらZumoを停止させる
+    driveStopRequested = true;
   }
 };
 
@@ -574,6 +625,29 @@ void executeBluetoothCommand(String command) {
 
 
   // ------------------------------
+  // DRIVE F/B/L/R/S
+  // M5Stackのジョイスティック入力をUnoへ中継
+  // ------------------------------
+
+  else if (command.startsWith("DRIVE ")) {
+
+    String value = command.substring(6);
+    value.trim();
+
+    if (
+      value.length() != 1 ||
+      !isDriveCommand(value[0])
+    ) {
+      notifyText("ERR " + command);
+    }
+
+    else {
+      sendDriveToUno(value[0]);
+    }
+  }
+
+
+  // ------------------------------
   // LIST
   // ------------------------------
 
@@ -602,6 +676,12 @@ void executeBluetoothCommand(String command) {
 // ==================================================
 
 void checkBluetooth() {
+
+  // BLEが切れた場合は，音声再生中でも次の確認タイミングで停止命令を送る
+  if (driveStopRequested) {
+    driveStopRequested = false;
+    sendDriveToUno('S');
+  }
 
   char command[COMMAND_MAX_LENGTH + 1];
 
@@ -923,6 +1003,21 @@ void setup() {
 
 
   // ------------------------------
+  // Arduino Uno / Zumo UART
+  // ------------------------------
+
+  UnoSerial.begin(
+    UNO_UART_BAUD,
+    SERIAL_8N1,
+    UNO_UART_RX_PIN,
+    UNO_UART_TX_PIN
+  );
+
+  // 起動時は必ず停止状態から始める
+  sendDriveToUno('S');
+
+
+  // ------------------------------
   // IMU
   // ------------------------------
 
@@ -1094,6 +1189,10 @@ void setup() {
 
   Serial.println(
     "  VOL n (0-100)"
+  );
+
+  Serial.println(
+    "  DRIVE F/B/L/R/S"
   );
 
   Serial.print(
